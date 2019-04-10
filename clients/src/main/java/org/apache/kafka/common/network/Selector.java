@@ -533,20 +533,7 @@ public class Selector implements Selectable, AutoCloseable {
 
                 /* if channel is not ready finish prepare */
                 if (channel.isConnected() && !channel.ready()) {
-                    try {
-                        channel.prepare();
-                    } catch (AuthenticationException e) {
-                        boolean isReauthentication = channel.successfulAuthentications() > 0;
-                        if (isReauthentication)
-                            sensors.failedReauthentication.record();
-                        else
-                            sensors.failedAuthentication.record();
-                        log.info("Address {} failed {}authentication ({})",
-                            channel.socketDescription(),
-                            isReauthentication ? "re-" : "",
-                            e.getClass().getName());
-                        throw e;
-                    }
+                    channel.prepare();
                     if (channel.ready()) {
                         long readyTimeMs = time.milliseconds();
                         boolean isReauthentication = channel.successfulAuthentications() > 1;
@@ -563,8 +550,8 @@ public class Selector implements Selectable, AutoCloseable {
                             if (!channel.connectedClientSupportsReauthentication())
                                 sensors.successfulAuthenticationNoReauth.record(1.0, readyTimeMs);
                         }
-                        log.debug("Address {} successfully {}authenticated",
-                            channel.socketDescription(), isReauthentication ? "re-" : "");
+                        log.debug("Successfully {}authenticated with {}", isReauthentication ?
+                            "re-" : "", channel.socketDescription());
                     }
                     List<NetworkReceive> responsesReceivedDuringReauthentication = channel
                             .getAndClearResponsesReceivedDuringReauthentication();
@@ -605,12 +592,22 @@ public class Selector implements Selectable, AutoCloseable {
 
             } catch (Exception e) {
                 String desc = channel.socketDescription();
-                if (e instanceof IOException)
+                if (e instanceof IOException) {
                     log.debug("Connection with {} disconnected", desc, e);
-                else if (e instanceof AuthenticationException) // will be logged later as error by clients
-                    log.debug("Connection with {} disconnected due to authentication exception", desc, e);
-                else
+                } else if (e instanceof AuthenticationException) {
+                    boolean isReauthentication = channel.successfulAuthentications() > 0;
+                    if (isReauthentication)
+                        sensors.failedReauthentication.record();
+                    else
+                        sensors.failedAuthentication.record();
+                    String exceptionMessage = e.getMessage();
+                    if (e instanceof DelayedResponseAuthenticationException)
+                        exceptionMessage = e.getCause().getMessage();
+                    log.info("Failed {}authentication with {} ({})", isReauthentication ? "re-" : "",
+                        desc, exceptionMessage);
+                } else {
                     log.warn("Unexpected error from {}; closing connection", desc, e);
+                }
 
                 if (e instanceof DelayedResponseAuthenticationException)
                     maybeDelayCloseOnAuthenticationFailure(channel);
@@ -920,6 +917,28 @@ public class Selector implements Selectable, AutoCloseable {
      */
     public KafkaChannel closingChannel(String id) {
         return closingChannels.get(id);
+    }
+
+    /**
+     * Returns the lowest priority channel chosen using the following sequence:
+     *   1) If one or more channels are in closing state, return any one of them
+     *   2) If idle expiry manager is enabled, return the least recently updated channel
+     *   3) Otherwise return any of the channels
+     *
+     * This method is used to close a channel to accommodate a new channel on the inter-broker listener
+     * when broker-wide `max.connections` limit is enabled.
+     */
+    public KafkaChannel lowestPriorityChannel() {
+        KafkaChannel channel = null;
+        if (!closingChannels.isEmpty()) {
+            channel = closingChannels.values().iterator().next();
+        } else if (idleExpiryManager != null && !idleExpiryManager.lruConnections.isEmpty()) {
+            String channelId = idleExpiryManager.lruConnections.keySet().iterator().next();
+            channel = channel(channelId);
+        } else if (!channels.isEmpty()) {
+            channel = channels.values().iterator().next();
+        }
+        return channel;
     }
 
     /**

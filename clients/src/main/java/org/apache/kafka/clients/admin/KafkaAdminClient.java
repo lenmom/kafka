@@ -45,6 +45,7 @@ import org.apache.kafka.common.TopicPartitionInfo;
 import org.apache.kafka.common.TopicPartitionReplica;
 import org.apache.kafka.common.acl.AclBinding;
 import org.apache.kafka.common.acl.AclBindingFilter;
+import org.apache.kafka.common.acl.AclOperation;
 import org.apache.kafka.common.annotation.InterfaceStability;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.ApiException;
@@ -59,6 +60,15 @@ import org.apache.kafka.common.errors.UnknownServerException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.internals.KafkaFutureImpl;
+import org.apache.kafka.common.message.CreateTopicsRequestData;
+import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicSet;
+import org.apache.kafka.common.message.CreateTopicsResponseData.CreatableTopicResult;
+import org.apache.kafka.common.message.DeleteTopicsRequestData;
+import org.apache.kafka.common.message.DeleteTopicsResponseData.DeletableTopicResult;
+import org.apache.kafka.common.message.DescribeGroupsRequestData;
+import org.apache.kafka.common.message.DescribeGroupsResponseData.DescribedGroup;
+import org.apache.kafka.common.message.DescribeGroupsResponseData.DescribedGroupMember;
+import org.apache.kafka.common.message.MetadataRequestData;
 import org.apache.kafka.common.metrics.JmxReporter;
 import org.apache.kafka.common.metrics.MetricConfig;
 import org.apache.kafka.common.metrics.Metrics;
@@ -105,6 +115,8 @@ import org.apache.kafka.common.requests.DescribeGroupsRequest;
 import org.apache.kafka.common.requests.DescribeGroupsResponse;
 import org.apache.kafka.common.requests.DescribeLogDirsRequest;
 import org.apache.kafka.common.requests.DescribeLogDirsResponse;
+import org.apache.kafka.common.requests.ElectPreferredLeadersRequest;
+import org.apache.kafka.common.requests.ElectPreferredLeadersResponse;
 import org.apache.kafka.common.requests.ExpireDelegationTokenRequest;
 import org.apache.kafka.common.requests.ExpireDelegationTokenResponse;
 import org.apache.kafka.common.requests.FindCoordinatorRequest;
@@ -123,9 +135,11 @@ import org.apache.kafka.common.utils.AppInfoParser;
 import org.apache.kafka.common.utils.KafkaThread;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
 import org.slf4j.Logger;
 
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -146,6 +160,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
+import static org.apache.kafka.common.requests.MetadataRequest.convertToMetadataRequestTopic;
 import static org.apache.kafka.common.utils.Utils.closeQuietly;
 
 /**
@@ -1211,7 +1226,9 @@ public class KafkaAdminClient extends AdminClient {
                     // Since this only requests node information, it's safe to pass true
                     // for allowAutoTopicCreation (and it simplifies communication with
                     // older brokers)
-                    return new MetadataRequest.Builder(Collections.emptyList(), true);
+                    return new MetadataRequest.Builder(new MetadataRequestData()
+                        .setTopics(Collections.emptyList())
+                        .setAllowAutoTopicCreation(true));
                 }
 
                 @Override
@@ -1246,11 +1263,16 @@ public class KafkaAdminClient extends AdminClient {
         return groupId == null;
     }
 
+    //for testing
+    int numPendingCalls() {
+        return runnable.pendingCalls.size();
+    }
+
     @Override
     public CreateTopicsResult createTopics(final Collection<NewTopic> newTopics,
                                            final CreateTopicsOptions options) {
         final Map<String, KafkaFutureImpl<Void>> topicFutures = new HashMap<>(newTopics.size());
-        final Map<String, CreateTopicsRequest.TopicDetails> topicsMap = new HashMap<>(newTopics.size());
+        final CreatableTopicSet topics = new CreatableTopicSet();
         for (NewTopic newTopic : newTopics) {
             if (topicNameIsUnrepresentable(newTopic.name())) {
                 KafkaFutureImpl<Void> future = new KafkaFutureImpl<>();
@@ -1259,7 +1281,7 @@ public class KafkaAdminClient extends AdminClient {
                 topicFutures.put(newTopic.name(), future);
             } else if (!topicFutures.containsKey(newTopic.name())) {
                 topicFutures.put(newTopic.name(), new KafkaFutureImpl<>());
-                topicsMap.put(newTopic.name(), newTopic.convertToTopicDetails());
+                topics.add(newTopic.convertToCreatableTopic());
             }
         }
         final long now = time.milliseconds();
@@ -1268,27 +1290,33 @@ public class KafkaAdminClient extends AdminClient {
 
             @Override
             public AbstractRequest.Builder createRequest(int timeoutMs) {
-                return new CreateTopicsRequest.Builder(topicsMap, timeoutMs, options.shouldValidateOnly());
+                return new CreateTopicsRequest.Builder(
+                    new CreateTopicsRequestData().
+                        setTopics(topics).
+                        setTimeoutMs(timeoutMs).
+                        setValidateOnly(options.shouldValidateOnly()));
             }
 
             @Override
             public void handleResponse(AbstractResponse abstractResponse) {
                 CreateTopicsResponse response = (CreateTopicsResponse) abstractResponse;
                 // Check for controller change
-                for (ApiError error : response.errors().values()) {
-                    if (error.error() == Errors.NOT_CONTROLLER) {
+                for (Errors error : response.errorCounts().keySet()) {
+                    if (error == Errors.NOT_CONTROLLER) {
                         metadataManager.clearController();
                         metadataManager.requestUpdate();
                         throw error.exception();
                     }
                 }
                 // Handle server responses for particular topics.
-                for (Map.Entry<String, ApiError> entry : response.errors().entrySet()) {
-                    KafkaFutureImpl<Void> future = topicFutures.get(entry.getKey());
+                for (CreatableTopicResult result : response.data().topics()) {
+                    KafkaFutureImpl<Void> future = topicFutures.get(result.name());
                     if (future == null) {
-                        log.warn("Server response mentioned unknown topic {}", entry.getKey());
+                        log.warn("Server response mentioned unknown topic {}", result.name());
                     } else {
-                        ApiException exception = entry.getValue().exception();
+                        ApiError error = new ApiError(
+                            Errors.forCode(result.errorCode()), result.errorMessage());
+                        ApiException exception = error.exception();
                         if (exception != null) {
                             future.completeExceptionally(exception);
                         } else {
@@ -1311,7 +1339,7 @@ public class KafkaAdminClient extends AdminClient {
                 completeAllExceptionally(topicFutures.values(), throwable);
             }
         };
-        if (!topicsMap.isEmpty()) {
+        if (!topics.isEmpty()) {
             runnable.call(call, now);
         }
         return new CreateTopicsResult(new HashMap<>(topicFutures));
@@ -1339,14 +1367,16 @@ public class KafkaAdminClient extends AdminClient {
 
             @Override
             AbstractRequest.Builder createRequest(int timeoutMs) {
-                return new DeleteTopicsRequest.Builder(new HashSet<>(validTopicNames), timeoutMs);
+                return new DeleteTopicsRequest.Builder(new DeleteTopicsRequestData()
+                        .setTopicNames(validTopicNames)
+                        .setTimeoutMs(timeoutMs));
             }
 
             @Override
             void handleResponse(AbstractResponse abstractResponse) {
                 DeleteTopicsResponse response = (DeleteTopicsResponse) abstractResponse;
                 // Check for controller change
-                for (Errors error : response.errors().values()) {
+                for (Errors error : response.errorCounts().keySet()) {
                     if (error == Errors.NOT_CONTROLLER) {
                         metadataManager.clearController();
                         metadataManager.requestUpdate();
@@ -1354,12 +1384,12 @@ public class KafkaAdminClient extends AdminClient {
                     }
                 }
                 // Handle server responses for particular topics.
-                for (Map.Entry<String, Errors> entry : response.errors().entrySet()) {
-                    KafkaFutureImpl<Void> future = topicFutures.get(entry.getKey());
+                for (DeletableTopicResult result : response.data().responses()) {
+                    KafkaFutureImpl<Void> future = topicFutures.get(result.name());
                     if (future == null) {
-                        log.warn("Server response mentioned unknown topic {}", entry.getKey());
+                        log.warn("Server response mentioned unknown topic {}", result.name());
                     } else {
-                        ApiException exception = entry.getValue().exception();
+                        ApiException exception = Errors.forCode(result.errorCode()).exception();
                         if (exception != null) {
                             future.completeExceptionally(exception);
                         } else {
@@ -1445,7 +1475,10 @@ public class KafkaAdminClient extends AdminClient {
             @Override
             AbstractRequest.Builder createRequest(int timeoutMs) {
                 if (supportsDisablingTopicCreation)
-                    return new MetadataRequest.Builder(topicNamesList, false);
+                    return new MetadataRequest.Builder(new MetadataRequestData()
+                        .setTopics(convertToMetadataRequestTopic(topicNamesList))
+                        .setAllowAutoTopicCreation(false)
+                        .setIncludeTopicAuthorizedOperations(options.includeAuthorizedOperations()));
                 else
                     return MetadataRequest.Builder.allTopics();
             }
@@ -1478,7 +1511,8 @@ public class KafkaAdminClient extends AdminClient {
                         partitions.add(topicPartitionInfo);
                     }
                     partitions.sort(Comparator.comparingInt(TopicPartitionInfo::partition));
-                    TopicDescription topicDescription = new TopicDescription(topicName, isInternal, partitions);
+                    TopicDescription topicDescription = new TopicDescription(topicName, isInternal, partitions,
+                        validAclOperations(response.data().topics().find(topicName).topicAuthorizedOperations()));
                     future.complete(topicDescription);
                 }
             }
@@ -1514,6 +1548,8 @@ public class KafkaAdminClient extends AdminClient {
         final KafkaFutureImpl<Collection<Node>> describeClusterFuture = new KafkaFutureImpl<>();
         final KafkaFutureImpl<Node> controllerFuture = new KafkaFutureImpl<>();
         final KafkaFutureImpl<String> clusterIdFuture = new KafkaFutureImpl<>();
+        final KafkaFutureImpl<Set<AclOperation>> authorizedOperationsFuture = new KafkaFutureImpl<>();
+
         final long now = time.milliseconds();
         runnable.call(new Call("listNodes", calcDeadlineMs(now, options.timeoutMs()),
             new LeastLoadedNodeProvider()) {
@@ -1522,7 +1558,10 @@ public class KafkaAdminClient extends AdminClient {
             AbstractRequest.Builder createRequest(int timeoutMs) {
                 // Since this only requests node information, it's safe to pass true for allowAutoTopicCreation (and it
                 // simplifies communication with older brokers)
-                return new MetadataRequest.Builder(Collections.emptyList(), true);
+                return new MetadataRequest.Builder(new MetadataRequestData()
+                    .setTopics(Collections.emptyList())
+                    .setAllowAutoTopicCreation(true)
+                    .setIncludeClusterAuthorizedOperations(options.includeAuthorizedOperations()));
             }
 
             @Override
@@ -1531,6 +1570,8 @@ public class KafkaAdminClient extends AdminClient {
                 describeClusterFuture.complete(response.brokers());
                 controllerFuture.complete(controller(response));
                 clusterIdFuture.complete(response.clusterId());
+                authorizedOperationsFuture.complete(
+                    validAclOperations(response.data().clusterAuthorizedOperations()));
             }
 
             private Node controller(MetadataResponse response) {
@@ -1544,10 +1585,12 @@ public class KafkaAdminClient extends AdminClient {
                 describeClusterFuture.completeExceptionally(throwable);
                 controllerFuture.completeExceptionally(throwable);
                 clusterIdFuture.completeExceptionally(throwable);
+                authorizedOperationsFuture.completeExceptionally(throwable);
             }
         }, now);
 
-        return new DescribeClusterResult(describeClusterFuture, controllerFuture, clusterIdFuture);
+        return new DescribeClusterResult(describeClusterFuture, controllerFuture, clusterIdFuture,
+            authorizedOperationsFuture);
     }
 
     @Override
@@ -2162,7 +2205,9 @@ public class KafkaAdminClient extends AdminClient {
 
             @Override
             AbstractRequest.Builder createRequest(int timeoutMs) {
-                return new MetadataRequest.Builder(new ArrayList<>(topics), false);
+                return new MetadataRequest.Builder(new MetadataRequestData()
+                    .setTopics(convertToMetadataRequestTopic(topics))
+                    .setAllowAutoTopicCreation(false));
             }
 
             @Override
@@ -2419,7 +2464,10 @@ public class KafkaAdminClient extends AdminClient {
                     runnable.call(new Call("describeConsumerGroups", deadline, new ConstantNodeIdProvider(nodeId)) {
                         @Override
                         AbstractRequest.Builder createRequest(int timeoutMs) {
-                            return new DescribeGroupsRequest.Builder(Collections.singletonList(groupId));
+                            return new DescribeGroupsRequest.Builder(
+                                new DescribeGroupsRequestData()
+                                    .setGroups(Collections.singletonList(groupId))
+                                    .setIncludeAuthorizedOperations(options.includeAuthorizedOperations()));
                         }
 
                         @Override
@@ -2427,23 +2475,27 @@ public class KafkaAdminClient extends AdminClient {
                             final DescribeGroupsResponse response = (DescribeGroupsResponse) abstractResponse;
 
                             KafkaFutureImpl<ConsumerGroupDescription> future = futures.get(groupId);
-                            final DescribeGroupsResponse.GroupMetadata groupMetadata = response.groups().get(groupId);
+                            final DescribedGroup describedGroup = response.data()
+                                .groups()
+                                .stream()
+                                .filter(group -> groupId.equals(group.groupId()))
+                                .findFirst().get();
 
-                            final Errors groupError = groupMetadata.error();
+                            final Errors groupError = Errors.forCode(describedGroup.errorCode());
                             if (groupError != Errors.NONE) {
                                 // TODO: KAFKA-6789, we can retry based on the error code
                                 future.completeExceptionally(groupError.exception());
                             } else {
-                                final String protocolType = groupMetadata.protocolType();
+                                final String protocolType = describedGroup.protocolType();
                                 if (protocolType.equals(ConsumerProtocol.PROTOCOL_TYPE) || protocolType.isEmpty()) {
-                                    final List<DescribeGroupsResponse.GroupMember> members = groupMetadata.members();
+                                    final List<DescribedGroupMember> members = describedGroup.members();
                                     final List<MemberDescription> memberDescriptions = new ArrayList<>(members.size());
-
-                                    for (DescribeGroupsResponse.GroupMember groupMember : members) {
+                                    final Set<AclOperation> authorizedOperations = validAclOperations(describedGroup.authorizedOperations());
+                                    for (DescribedGroupMember groupMember : members) {
                                         Set<TopicPartition> partitions = Collections.emptySet();
-                                        if (groupMember.memberAssignment().remaining() > 0) {
+                                        if (groupMember.memberAssignment().length > 0) {
                                             final PartitionAssignor.Assignment assignment = ConsumerProtocol.
-                                                deserializeAssignment(groupMember.memberAssignment().duplicate());
+                                                deserializeAssignment(ByteBuffer.wrap(groupMember.memberAssignment()));
                                             partitions = new HashSet<>(assignment.partitions());
                                         }
                                         final MemberDescription memberDescription =
@@ -2454,12 +2506,12 @@ public class KafkaAdminClient extends AdminClient {
                                         memberDescriptions.add(memberDescription);
                                     }
                                     final ConsumerGroupDescription consumerGroupDescription =
-                                            new ConsumerGroupDescription(groupId,
-                                                protocolType.isEmpty(),
+                                            new ConsumerGroupDescription(groupId, protocolType.isEmpty(),
                                                 memberDescriptions,
-                                                groupMetadata.protocol(),
-                                                ConsumerGroupState.parse(groupMetadata.state()),
-                                                fcResponse.node());
+                                                describedGroup.protocolData(),
+                                                ConsumerGroupState.parse(describedGroup.groupState()),
+                                                fcResponse.node(),
+                                                authorizedOperations);
                                     future.complete(consumerGroupDescription);
                                 }
                             }
@@ -2482,6 +2534,16 @@ public class KafkaAdminClient extends AdminClient {
         }
 
         return new DescribeConsumerGroupsResult(new HashMap<>(futures));
+    }
+
+    private Set<AclOperation> validAclOperations(final int authorizedOperations) {
+        return Utils.from32BitField(authorizedOperations)
+            .stream()
+            .map(AclOperation::fromCode)
+            .filter(operation -> operation != AclOperation.UNKNOWN
+                && operation != AclOperation.ALL
+                && operation != AclOperation.ANY)
+            .collect(Collectors.toSet());
     }
 
     private boolean handleFindCoordinatorError(FindCoordinatorResponse response, KafkaFutureImpl<?> future) {
@@ -2549,7 +2611,9 @@ public class KafkaAdminClient extends AdminClient {
         runnable.call(new Call("findAllBrokers", deadline, new LeastLoadedNodeProvider()) {
             @Override
             AbstractRequest.Builder createRequest(int timeoutMs) {
-                return new MetadataRequest.Builder(Collections.emptyList(), true);
+                return new MetadataRequest.Builder(new MetadataRequestData()
+                    .setTopics(Collections.emptyList())
+                    .setAllowAutoTopicCreation(true));
             }
 
             @Override
@@ -2777,4 +2841,35 @@ public class KafkaAdminClient extends AdminClient {
     public Map<MetricName, ? extends Metric> metrics() {
         return Collections.unmodifiableMap(this.metrics.metrics());
     }
+
+    @Override
+    public ElectPreferredLeadersResult electPreferredLeaders(final Collection<TopicPartition> partitions,
+                                                             ElectPreferredLeadersOptions options) {
+        final Set<TopicPartition> partitionSet = partitions != null ? new HashSet<>(partitions) : null;
+        final KafkaFutureImpl<Map<TopicPartition, ApiError>> electionFuture = new KafkaFutureImpl<>();
+        final long now = time.milliseconds();
+        runnable.call(new Call("electPreferredLeaders", calcDeadlineMs(now, options.timeoutMs()),
+                new ControllerNodeProvider()) {
+
+            @Override
+            public AbstractRequest.Builder createRequest(int timeoutMs) {
+                return new ElectPreferredLeadersRequest.Builder(
+                        ElectPreferredLeadersRequest.toRequestData(partitions, timeoutMs));
+            }
+
+            @Override
+            public void handleResponse(AbstractResponse abstractResponse) {
+                ElectPreferredLeadersResponse response = (ElectPreferredLeadersResponse) abstractResponse;
+                electionFuture.complete(
+                        ElectPreferredLeadersRequest.fromResponseData(response.data()));
+            }
+
+            @Override
+            void handleFailure(Throwable throwable) {
+                electionFuture.completeExceptionally(throwable);
+            }
+        }, now);
+        return new ElectPreferredLeadersResult(electionFuture, partitionSet);
+    }
+
 }
